@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Document Versioning System (MVP)</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@editorjs/editorjs@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@editorjs/header@latest"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-title">Doc Versions</div>
+      </div>
+
+      <div class="toolbar" role="group" aria-label="Document toolbar">
+        <div class="group">
+          <label for="docSelect">Document</label>
+          <select id="docSelect"></select>
+          <button id="newDocBtn" type="button" class="btn">New</button>
+          <button id="deleteDocBtn" type="button" class="btn btn-danger">Delete</button>
+        </div>
+
+        <div class="group">
+          <button id="saveBtn" type="button" class="btn btn-primary">Save</button>
+        </div>
+
+        <div class="group">
+          <label for="verSelect">Version</label>
+          <select id="verSelect"></select>
+          <button id="rollbackBtn" type="button" class="btn btn-danger">Rollback</button>
+          <button id="deleteVerBtn" type="button" class="btn">Delete version</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="layout">
+        <aside class="card sidebar" aria-label="Documents">
+          <div class="card-head">
+            <div class="card-title">Documents</div>
+            <div class="card-meta" id="docCount"></div>
+          </div>
+          <div class="doc-list" id="docList"></div>
+        </aside>
+
+        <section class="card content">
+          <div class="card-head">
+            <div class="card-title">Editor</div>
+            <div class="card-meta" id="meta"></div>
+          </div>
+          <div id="editor" class="editor"></div>
+        </section>
+      </div>
+    </main>
+
+    <div class="modal-backdrop" id="newDocModal" aria-hidden="true">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="newDocTitle">
+        <div class="modal-title" id="newDocTitle">New document</div>
+        <div class="modal-body">
+          <label for="newDocInput">Title</label>
+          <input id="newDocInput" class="input" type="text" maxlength="200" />
+        </div>
+        <div class="modal-actions">
+          <button id="newDocCancel" type="button" class="btn">Cancel</button>
+          <button id="newDocCreate" type="button" class="btn btn-primary">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const metaEl = document.getElementById('meta');
+      const docListEl = document.getElementById('docList');
+      const docCountEl = document.getElementById('docCount');
+      const docSelect = document.getElementById('docSelect');
+      const verSelect = document.getElementById('verSelect');
+      const newDocBtn = document.getElementById('newDocBtn');
+      const deleteDocBtn = document.getElementById('deleteDocBtn');
+      const saveBtn = document.getElementById('saveBtn');
+      const rollbackBtn = document.getElementById('rollbackBtn');
+      const deleteVerBtn = document.getElementById('deleteVerBtn');
+
+      const newDocModal = document.getElementById('newDocModal');
+      const newDocInput = document.getElementById('newDocInput');
+      const newDocCancel = document.getElementById('newDocCancel');
+      const newDocCreate = document.getElementById('newDocCreate');
+
+      let editor = null;
+      let currentDocId = null;
+      let currentVersionId = null;
+      let currentVersionRevision = null;
+      let previewVersionLabel = null;
+      let suppressVersionChange = false;
+      let documentsCache = [];
+
+      function setStatus(_) {}
+
+      let lastErrorText = null;
+      function showError(err) {
+        const text = String(err || 'Error');
+        if (text === lastErrorText) {
+          return;
+        }
+        lastErrorText = text;
+        alert(text);
+      }
+
+      function openNewDocModal() {
+        newDocModal.setAttribute('aria-hidden', 'false');
+        newDocModal.classList.add('open');
+        newDocInput.value = 'Untitled';
+        setTimeout(() => newDocInput.focus(), 0);
+      }
+
+      function closeNewDocModal() {
+        newDocModal.setAttribute('aria-hidden', 'true');
+        newDocModal.classList.remove('open');
+      }
+
+      function setMeta() {
+        const docId = currentDocId ? `#${currentDocId}` : '-';
+        const verId = currentVersionId ? `#${currentVersionId}` : '-';
+        const verRev = currentVersionRevision ? `v${currentVersionRevision}` : '-';
+        const preview = previewVersionLabel ? ` · Preview ${previewVersionLabel}` : '';
+        metaEl.textContent = `Document ${docId} · Current ${verRev} (${verId})${preview}`;
+      }
+
+      function ensureEditor(initialData) {
+        if (!editor) {
+          editor = new EditorJS({
+            holder: 'editor',
+            data: initialData,
+            autofocus: true,
+            tools: {
+              header: {
+                class: Header,
+                inlineToolbar: true,
+                config: { levels: [2, 3, 4], defaultLevel: 3 },
+              },
+            },
+          });
+          return;
+        }
+
+        if (typeof editor.render === 'function') {
+          Promise.resolve(editor.render(initialData)).catch(showError);
+          return;
+        }
+
+        editor = new EditorJS({
+          holder: 'editor',
+          data: initialData,
+          autofocus: true,
+          tools: {
+            header: {
+              class: Header,
+              inlineToolbar: true,
+              config: { levels: [2, 3, 4], defaultLevel: 3 },
+            },
+          },
+        });
+      }
+
+      async function apiJson(url, options) {
+        const resp = await fetch(url, {
+          headers: { 'Content-Type': 'application/json' },
+          ...options,
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(text || `HTTP ${resp.status}`);
+        }
+        return await resp.json();
+      }
+
+      async function apiOk(url, options) {
+        const resp = await fetch(url, {
+          headers: { 'Content-Type': 'application/json' },
+          ...options,
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(text || `HTTP ${resp.status}`);
+        }
+      }
+
+      function renderDocList(docs) {
+        docListEl.innerHTML = '';
+        for (const d of docs) {
+          const row = document.createElement('div');
+          row.className = 'doc-item' + (d.id === currentDocId ? ' active' : '');
+
+          const left = document.createElement('button');
+          left.type = 'button';
+          left.className = 'doc-open';
+          left.textContent = d.title;
+          left.addEventListener('click', async () => {
+            try {
+              docSelect.value = String(d.id);
+              await loadDocument(d.id);
+              await loadVersions(d.id);
+            } catch (e) {
+              setStatus(String(e));
+            }
+          });
+
+          const del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'doc-del';
+          del.textContent = 'Delete';
+          del.addEventListener('click', async (ev) => {
+            ev.stopPropagation();
+            try {
+              const ok = confirm(`Delete document #${d.id}? This will delete all its versions.`);
+              if (!ok) return;
+              await apiOk(`/api/documents/${d.id}`, { method: 'DELETE' });
+              if (currentDocId === d.id) {
+                currentDocId = null;
+                currentVersionId = null;
+              }
+              await refreshAll();
+              setStatus(`Deleted document #${d.id}`);
+            } catch (e) {
+              setStatus(String(e));
+            }
+          });
+
+          row.appendChild(left);
+          const badge = document.createElement('span');
+          badge.className = 'doc-badge';
+          badge.textContent = `v${d.current_version_revision}`;
+          row.appendChild(badge);
+          row.appendChild(del);
+          docListEl.appendChild(row);
+        }
+        docCountEl.textContent = `${docs.length} total`;
+      }
+
+      async function loadDocuments() {
+        const docs = await apiJson('/api/documents', { method: 'GET' });
+        documentsCache = docs;
+        docSelect.innerHTML = '';
+        for (const d of docs) {
+          const opt = document.createElement('option');
+          opt.value = String(d.id);
+          opt.textContent = d.title;
+          docSelect.appendChild(opt);
+        }
+
+        if (docs.length === 0) {
+          const created = await apiJson('/api/documents', {
+            method: 'POST',
+            body: JSON.stringify({ title: 'Untitled' }),
+          });
+          await loadDocuments();
+          currentDocId = created.id;
+          docSelect.value = String(created.id);
+        } else {
+          if (!currentDocId) {
+            currentDocId = docs[0].id;
+          }
+          docSelect.value = String(currentDocId);
+        }
+
+        renderDocList(docs);
+      }
+
+      async function loadDocument(docId) {
+        const doc = await apiJson(`/api/documents/${docId}`, { method: 'GET' });
+        currentDocId = doc.id;
+        currentVersionId = doc.current_version_id;
+        currentVersionRevision = doc.current_version_revision;
+        previewVersionLabel = null;
+        ensureEditor(doc.content);
+        setStatus(`Loaded document #${doc.id} (current v${doc.current_version_revision})`);
+        setMeta();
+        renderDocList(documentsCache);
+      }
+
+      async function loadVersions(docId) {
+        const versions = await apiJson(`/api/documents/${docId}/versions`, { method: 'GET' });
+        suppressVersionChange = true;
+        verSelect.innerHTML = '';
+        for (const v of versions) {
+          const opt = document.createElement('option');
+          opt.value = String(v.id);
+          const currentMark = v.id === currentVersionId ? ' (current)' : '';
+          opt.textContent = `v${v.revision}${currentMark}`;
+          verSelect.appendChild(opt);
+        }
+        if (currentVersionId) {
+          verSelect.value = String(currentVersionId);
+        }
+        const current = versions.find((v) => v.id === currentVersionId);
+        currentVersionRevision = current ? current.revision : currentVersionRevision;
+        if (!previewVersionLabel) {
+          setMeta();
+        }
+
+        const hasVersions = versions.length > 0;
+        verSelect.disabled = !hasVersions;
+        rollbackBtn.disabled = !hasVersions;
+        deleteVerBtn.disabled = !hasVersions;
+        suppressVersionChange = false;
+      }
+
+      async function refreshAll() {
+        await loadDocuments();
+        const selected = docSelect.value;
+        if (!selected) {
+          ensureEditor({ time: 0, blocks: [], version: '2' });
+          return;
+        }
+        await loadDocument(selected);
+        await loadVersions(selected);
+      }
+
+      docSelect.addEventListener('change', async () => {
+        try {
+          const docId = docSelect.value;
+          await loadDocument(docId);
+          await loadVersions(docId);
+        } catch (e) {
+          showError(e);
+        }
+      });
+
+      newDocBtn.addEventListener('click', async () => {
+        openNewDocModal();
+      });
+
+      newDocCancel.addEventListener('click', () => {
+        closeNewDocModal();
+      });
+
+      newDocModal.addEventListener('click', (e) => {
+        if (e.target === newDocModal) {
+          closeNewDocModal();
+        }
+      });
+
+      newDocInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          newDocCreate.click();
+        }
+        if (e.key === 'Escape') {
+          closeNewDocModal();
+        }
+      });
+
+      newDocCreate.addEventListener('click', async () => {
+        try {
+          const title = (newDocInput.value || '').trim() || 'Untitled';
+          closeNewDocModal();
+          const created = await apiJson('/api/documents', {
+            method: 'POST',
+            body: JSON.stringify({ title }),
+          });
+          currentDocId = created.id;
+
+          await loadDocuments();
+          docSelect.value = String(created.id);
+          await loadDocument(created.id);
+          await loadVersions(created.id);
+        } catch (e) {
+          showError(e);
+        }
+      });
+
+      deleteDocBtn.addEventListener('click', async () => {
+        try {
+          if (!currentDocId) return;
+          const ok = confirm(`Delete document #${currentDocId}? This will delete all its versions.`);
+          if (!ok) return;
+          await apiOk(`/api/documents/${currentDocId}`, { method: 'DELETE' });
+          currentDocId = null;
+          currentVersionId = null;
+          await refreshAll();
+        } catch (e) {
+          showError(e);
+        }
+      });
+
+      saveBtn.addEventListener('click', async () => {
+        try {
+          saveBtn.disabled = true;
+          const content = await editor.save();
+          const res = await apiJson(`/api/documents/${currentDocId}/versions`, {
+            method: 'POST',
+            body: JSON.stringify({ content }),
+          });
+          currentVersionId = res.version_id;
+          previewVersionLabel = null;
+          await loadVersions(currentDocId);
+          await loadDocument(currentDocId);
+          await loadDocuments();
+          setMeta();
+        } catch (e) {
+          showError(e);
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+
+      rollbackBtn.addEventListener('click', async () => {
+        try {
+          const versionId = verSelect.value;
+          if (!versionId) {
+            return;
+          }
+          rollbackBtn.disabled = true;
+          const rawLabel = verSelect.options[verSelect.selectedIndex]?.textContent || `${versionId}`;
+          const label = rawLabel.replace(' (current)', '');
+          await apiJson(`/api/documents/${currentDocId}/rollback/${versionId}`, { method: 'POST' });
+          suppressVersionChange = true;
+          previewVersionLabel = null;
+          await loadDocument(currentDocId);
+          await loadVersions(currentDocId);
+          await loadDocuments();
+          suppressVersionChange = false;
+        } catch (e) {
+          showError(e);
+        } finally {
+          rollbackBtn.disabled = false;
+        }
+      });
+
+      verSelect.addEventListener('change', async () => {
+        try {
+          if (suppressVersionChange) return;
+          const versionId = verSelect.value;
+          if (!currentDocId || !versionId) return;
+          const label = verSelect.options[verSelect.selectedIndex]?.textContent || `${versionId}`;
+          const content = await apiJson(`/api/documents/${currentDocId}/versions/${versionId}`, { method: 'GET' });
+          ensureEditor(content);
+          previewVersionLabel = label.replace(' (current)', '');
+          setMeta();
+        } catch (e) {
+          showError(e);
+        }
+      });
+
+      deleteVerBtn.addEventListener('click', async () => {
+        try {
+          const versionId = verSelect.value;
+          if (!currentDocId || !versionId) return;
+          const ok = confirm(`Delete selected version?`);
+          if (!ok) return;
+          await apiOk(`/api/documents/${currentDocId}/versions/${versionId}`, { method: 'DELETE' });
+          await loadDocument(currentDocId);
+          await loadVersions(currentDocId);
+          await loadDocuments();
+        } catch (e) {
+          showError(e);
+        }
+      });
+
+      (async () => {
+        try {
+          await refreshAll();
+        } catch (e) {
+          showError(e);
+          ensureEditor({ time: 0, blocks: [], version: '2' });
+        }
+      })();
+    </script>
+  </body>
+</html>
+
