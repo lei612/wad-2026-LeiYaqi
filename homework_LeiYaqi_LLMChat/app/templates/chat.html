@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Homework 2 — Chat</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <div class="brand">LLM Chat</div>
+          <button id="logoutBtn" class="btn btn-ghost">Logout</button>
+        </div>
+
+        <div class="sidebar-new">
+          <input id="chatTitle" class="input" placeholder="New chat title" />
+          <button id="newChatBtn" class="btn btn-primary">New</button>
+        </div>
+
+        <div id="chats" class="chat-list"></div>
+      </aside>
+
+      <main class="content">
+        <header class="content-top">
+          <div id="chatMeta" class="meta">Select a chat</div>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <div class="composer">
+          <input id="msgInput" class="input" placeholder="Type a message..." />
+          <button id="sendBtn" class="btn btn-primary">Send</button>
+        </div>
+      </main>
+    </div>
+
+    <script>
+      const store = {
+        get access() { return localStorage.getItem('access_token') || ''; },
+        set access(v) { localStorage.setItem('access_token', v); },
+        get refresh() { return localStorage.getItem('refresh_token') || ''; },
+        set refresh(v) { localStorage.setItem('refresh_token', v); },
+        clear() { localStorage.removeItem('access_token'); localStorage.removeItem('refresh_token'); }
+      };
+
+      function requireAuth() {
+        if (!store.access || !store.refresh) {
+          window.location.href = '/';
+          return false;
+        }
+        return true;
+      }
+
+      async function api(path, options) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (store.access) headers['Authorization'] = `Bearer ${store.access}`;
+        const resp = await fetch(path, { headers, ...options });
+        if (resp.status === 401 && store.refresh) {
+          const rr = await fetch('/api/auth/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: store.refresh })
+          });
+          if (rr.ok) {
+            const data = await rr.json();
+            store.access = data.access_token;
+            return api(path, options);
+          }
+        }
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || `HTTP ${resp.status}`);
+        }
+        return resp.json();
+      }
+
+      let currentChatId = '';
+
+      function errText(e) {
+        const raw = e?.message || String(e);
+        try {
+          const j = JSON.parse(raw);
+          if (typeof j?.detail === 'string') return j.detail;
+        } catch (_) {}
+        return raw;
+      }
+
+      async function withBusy(btn, fn) {
+        btn.disabled = true;
+        try { return await fn(); } finally { btn.disabled = false; }
+      }
+
+      function renderChats(chats) {
+        const el = document.getElementById('chats');
+        el.innerHTML = '';
+        if (!chats.length) {
+          const empty = document.createElement('div');
+          empty.className = 'chat-empty';
+          empty.textContent = 'No chats yet';
+          el.appendChild(empty);
+          return;
+        }
+        for (const c of chats) {
+          const row = document.createElement('div');
+          row.className = 'chat-row' + (c.id === currentChatId ? ' active' : '');
+
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'chat-item';
+          b.textContent = c.title || 'Chat';
+          b.onclick = async () => {
+            await openChat(c.id);
+            await refreshChats();
+          };
+
+          const del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'chat-del';
+          del.textContent = '×';
+          del.title = 'Delete chat';
+          del.onclick = async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!confirm('Delete this chat?')) return;
+            await api(`/api/chats/${c.id}`, { method: 'DELETE' });
+            if (currentChatId === c.id) {
+              currentChatId = '';
+              document.getElementById('chatMeta').textContent = 'Select a chat';
+              renderMessages([]);
+            }
+            await refreshChats();
+          };
+
+          row.appendChild(b);
+          row.appendChild(del);
+          el.appendChild(row);
+        }
+      }
+
+      function renderMessages(messages) {
+        const el = document.getElementById('messages');
+        el.innerHTML = '';
+        for (const m of messages) {
+          const row = document.createElement('div');
+          row.className = 'msg ' + m.role;
+          row.textContent = m.content;
+          el.appendChild(row);
+        }
+        el.scrollTop = el.scrollHeight;
+      }
+
+      function appendMessage(role, content, opts) {
+        const el = document.getElementById('messages');
+        const row = document.createElement('div');
+        const loading = Boolean(opts && opts.loading);
+        row.className = 'msg ' + role + (loading ? ' loading' : '');
+        if (loading) {
+          const spin = document.createElement('span');
+          spin.className = 'spinner';
+          const label = document.createElement('span');
+          label.textContent = content || 'Thinking...';
+          row.appendChild(spin);
+          row.appendChild(label);
+        } else {
+          row.textContent = content;
+        }
+        el.appendChild(row);
+        el.scrollTop = el.scrollHeight;
+        return row;
+      }
+
+      function setMessageText(el, role, content) {
+        el.className = 'msg ' + role;
+        el.textContent = content;
+      }
+
+      async function refreshChats() {
+        const chats = await api('/api/chats', { method: 'GET' });
+        renderChats(chats);
+        if (!currentChatId && chats.length) {
+          await openChat(chats[0].id);
+          renderChats(chats);
+        }
+      }
+
+      async function refreshLlmStatus() {
+        try {
+          const s = await api('/api/llm/status', { method: 'GET' });
+          if (!s.configured) {
+            document.getElementById('chatMeta').textContent = 'LLM not configured (set OPENAI_API_KEY or run Ollama)';
+          }
+        } catch (_) {}
+      }
+
+      async function openChat(id) {
+        const c = await api(`/api/chats/${id}`, { method: 'GET' });
+        currentChatId = c.id;
+        document.getElementById('chatMeta').textContent = c.title || 'Chat';
+        renderMessages(c.messages || []);
+      }
+
+      document.getElementById('newChatBtn').onclick = async () => {
+        if (!requireAuth()) return;
+        const btn = document.getElementById('newChatBtn');
+        await withBusy(btn, async () => {
+          const title = document.getElementById('chatTitle').value.trim() || 'New chat';
+          document.getElementById('chatTitle').value = '';
+          const c = await api('/api/chats', { method: 'POST', body: JSON.stringify({ title }) });
+          await openChat(c.id);
+          await refreshChats();
+        }).catch((e) => alert(errText(e)));
+      };
+
+      document.getElementById('sendBtn').onclick = async () => {
+        if (!requireAuth()) return;
+        if (!currentChatId) {
+          alert('Create or select a chat first.');
+          return;
+        }
+        const btn = document.getElementById('sendBtn');
+        const input = document.getElementById('msgInput');
+        const content = input.value.trim();
+        if (!content) return;
+
+        const chatIdAtSend = currentChatId;
+        input.value = '';
+        appendMessage('user', content);
+        const loadingEl = appendMessage('assistant', 'Thinking...', { loading: true });
+
+        btn.disabled = true;
+        input.disabled = true;
+        try {
+          const resp = await api(`/api/chats/${chatIdAtSend}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
+          if (currentChatId !== chatIdAtSend) return;
+          const text = (resp && resp.assistant_message && resp.assistant_message.content) ? resp.assistant_message.content : '';
+          setMessageText(loadingEl, 'assistant', text || '(empty response)');
+        } catch (e) {
+          if (loadingEl && loadingEl.parentNode) loadingEl.parentNode.removeChild(loadingEl);
+          alert(errText(e));
+        } finally {
+          btn.disabled = false;
+          input.disabled = false;
+          input.focus();
+        }
+      };
+
+      document.getElementById('logoutBtn').onclick = () => {
+        store.clear();
+        window.location.href = '/';
+      };
+
+      (async () => {
+        const qp = new URLSearchParams(window.location.search);
+        const at = qp.get('access_token');
+        const rt = qp.get('refresh_token');
+        if (at && rt) {
+          store.access = at;
+          store.refresh = rt;
+          window.history.replaceState({}, document.title, '/chat');
+        }
+        if (!requireAuth()) return;
+        document.getElementById('chatTitle').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') document.getElementById('newChatBtn').click();
+        });
+        document.getElementById('msgInput').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') document.getElementById('sendBtn').click();
+        });
+        await refreshLlmStatus();
+        await refreshChats();
+      })().catch((e) => alert(String(e)));
+    </script>
+  </body>
+</html>
